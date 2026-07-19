@@ -7,6 +7,7 @@ import numpy.typing as npt
 import torch
 import torchvision
 from scipy.optimize import linear_sum_assignment
+from scipy.signal import find_peaks
 from skimage.measure import label
 
 
@@ -20,7 +21,11 @@ class SignalExtractor:
     debug: int
     lam: float
     min_line_width: int
+    height_difference_penalty: float
     num_peaks: Optional[int]
+    num_bands: Optional[int]
+    band_overlap_fraction: float
+    band_smoothing_fraction: float
 
     def __init__(
         self,
@@ -33,7 +38,15 @@ class SignalExtractor:
         debug: int = 0,
         lam: float = 0.5,
         min_line_width: int = 30,
+        height_difference_penalty: float = 30.0,
+        num_bands: Optional[int] = None,
+        band_overlap_fraction: float = 0.35,
+        band_smoothing_fraction: float = 0.1,
     ) -> None:
+        if height_difference_penalty < 0:
+            raise ValueError("height_difference_penalty must be non-negative")
+        if num_bands is not None and num_bands < 1:
+            raise ValueError("num_bands must be a positive integer or None")
         self.threshold_sum = threshold_sum
         self.threshold_line_in_mask = threshold_line_in_mask
         self.label_thresh = label_thresh
@@ -43,10 +56,16 @@ class SignalExtractor:
         self.debug = debug
         self.lam = lam
         self.min_line_width = min_line_width
+        self.height_difference_penalty = height_difference_penalty
+        self.num_bands = num_bands
+        self.band_overlap_fraction = band_overlap_fraction
+        self.band_smoothing_fraction = band_smoothing_fraction
         self.num_peaks = None
 
     def __call__(self, feature_map: torch.Tensor) -> torch.Tensor:
         fmap = feature_map.cpu().clone()
+        if self.num_bands is not None and self.num_bands > 1:
+            return self._banded_extract_and_merge(fmap, feature_map.shape[1])
         lines_list = self._iterative_extraction(fmap)
         self.num_peaks = self._autodetect_num_peaks(fmap)
         lines_list = [ln for ln in lines_list if (~torch.isnan(ln)).sum() > self.min_line_width]
@@ -70,6 +89,135 @@ class SignalExtractor:
                 break
             self._refine_fmap_by_removal(fmap, rej_maps)
         return good
+
+    def _banded_extract_and_merge(self, fmap: torch.Tensor, width: int) -> torch.Tensor:
+        """Extract and merge one line per lead in a stacked single-column layout.
+
+        For layouts such as 12x1 the leads occupy known, roughly evenly spaced
+        horizontal bands centred on their baselines. Each lead is extracted from
+        a window centred on its baseline that overlaps into the neighbouring
+        bands, so a tall deflection is captured in full instead of being clipped
+        at a hard band boundary. Fragments whose baseline does not belong to the
+        lead (signal that leaked in from a neighbour) are discarded, and the
+        remainder are merged into a single line -- guaranteeing one line per
+        lead without relying on the global fragment matcher.
+
+        Returns:
+            A ``(num_bands, W)`` tensor of merged lines, top band first, with
+            NaN where no signal was recovered.
+        """
+        self.num_peaks = self._autodetect_num_peaks(fmap)
+        centers = self._find_band_centers(fmap, self.num_bands)  # type: ignore[arg-type]
+        if self.debug:
+            self._plot_band_centers(fmap, centers)
+        if not centers:
+            return torch.empty((0, width), dtype=torch.float32)
+
+        H = fmap.shape[0]
+        band_height = self._median_spacing(centers, H)
+        reach = max(1, int(band_height * (0.5 + self.band_overlap_fraction)))
+
+        band_lines = []
+        for center in centers:
+            y0, y1 = max(0, center - reach), min(H, center + reach)
+            strip = fmap[y0:y1, :].clone()
+            band_lines.append(self._extract_band_line(strip, y0, center, band_height, width))
+
+        lines = self.preprocess_lines(torch.stack(band_lines, dim=0))
+        if self.debug:
+            self.plot_lines(lines, "Preprocessed Lines")
+        return lines
+
+    def _extract_band_line(
+        self, strip: torch.Tensor, y0: int, center: int, band_height: int, width: int
+    ) -> torch.Tensor:
+        """Extract one merged line for the lead centred at ``center``.
+
+        A fragment is kept only when its baseline (median row) lies within half
+        a band of ``center`` -- i.e. it belongs to this lead. Fragments further
+        out are a neighbouring lead's trace that leaked into the overlap margin;
+        filling this lead's honest gaps with them just injects the neighbour's
+        deflection spikes as noise, so they are dropped. The survivors (this
+        lead's own baseline and deflection pieces) are combined by priority: the
+        longest forms the line, and shorter ones only fill columns it left NaN.
+        """
+        fragments = [line + float(y0) for line in self._iterative_extraction(strip)]
+        fragments = [f for f in fragments if int((~torch.isnan(f)).sum()) > self.min_line_width]
+        fragments = [f for f in fragments if abs(float(torch.nanmedian(f)) - center) < band_height * 0.5]
+        if not fragments:
+            return torch.full((width,), float("nan"))
+
+        fragments.sort(key=lambda f: int((~torch.isnan(f)).sum()), reverse=True)
+        merged = fragments[0].clone()
+        for fragment in fragments[1:]:
+            fill = torch.isnan(merged) & ~torch.isnan(fragment)
+            merged[fill] = fragment[fill]
+        return merged
+
+    def _find_band_centers(self, fmap: torch.Tensor, num_bands: int) -> list[int]:
+        """Locate the baseline row of each stacked lead.
+
+        Baselines (flat isoelectric segments) span the full width and form the
+        sharpest, most reliable peaks in the row-mass profile. If peak detection
+        is unreliable, fall back to evenly spaced centres across the active span.
+        """
+        H = fmap.shape[0]
+        row_mass = self._smooth_row_mass(
+            fmap.sum(dim=1), max(1, int(H / num_bands * self.band_smoothing_fraction))
+        )
+        row_mass_np = row_mass.numpy()
+
+        peaks, props = find_peaks(
+            row_mass_np,
+            distance=max(1, H // (2 * num_bands)),
+            prominence=float(row_mass_np.max()) * 0.03,
+        )
+        if len(peaks) >= num_bands:
+            strongest = np.argsort(props["prominences"])[::-1][:num_bands]
+            return sorted(int(p) for p in peaks[strongest])
+
+        return self._even_band_centers(row_mass, num_bands)
+
+    def _even_band_centers(self, row_mass: torch.Tensor, num_bands: int) -> list[int]:
+        H = row_mass.shape[0]
+        active = (row_mass > row_mass.max() * 0.02).nonzero()
+        if active.numel() == 0:
+            y_top, y_bot = 0, H - 1
+        else:
+            y_top, y_bot = int(active[0].item()), int(active[-1].item())
+        band_height = max(1, (y_bot - y_top) / num_bands)
+        return [int(y_top + band_height * (i + 0.5)) for i in range(num_bands)]
+
+    def _median_spacing(self, centers: list[int], fallback: int) -> int:
+        if len(centers) < 2:
+            return fallback
+        return int(np.median(np.diff(sorted(centers))))
+
+    def _plot_band_centers(self, fmap: torch.Tensor, centers: list[int]) -> None:
+        row_mass = fmap.sum(dim=1)
+        band_height = self._median_spacing(centers, fmap.shape[0])
+        reach = max(1, int(band_height * (0.5 + self.band_overlap_fraction)))
+        fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(12, 6))
+        ax0.imshow(fmap.numpy(), aspect="auto", cmap="magma")
+        for c in centers:
+            ax0.axhline(c, color="lime", linewidth=0.8)
+            ax0.axhspan(c - reach, c + reach, color="cyan", alpha=0.06)
+        ax0.set_title("signal_prob: baselines (green) and overlapping bands")
+        ax1.plot(row_mass.numpy(), np.arange(len(row_mass)))
+        for c in centers:
+            ax1.axhline(c, color="lime", linewidth=0.8)
+        ax1.invert_yaxis()
+        ax1.set_title("row mass (sum over x)")
+        plt.savefig("sandbox/band_boundaries.png", dpi=110)
+        plt.close()
+
+    def _smooth_row_mass(self, row_mass: torch.Tensor, kernel_size: int) -> torch.Tensor:
+        if kernel_size <= 1:
+            return row_mass
+        pad = kernel_size // 2
+        kernel = torch.ones(1, 1, kernel_size) / kernel_size
+        padded = torch.nn.functional.pad(row_mass.view(1, 1, -1), (pad, pad), mode="replicate")
+        return torch.nn.functional.conv1d(padded, kernel).view(-1)
 
     def _extract_candidate_lines(
         self, fmap: torch.Tensor
@@ -267,7 +415,9 @@ class SignalExtractor:
         heights_norm = (heights - heights.min()) / heights.max()
         heights_diff = torch.abs(heights_norm.unsqueeze(1) - heights_norm.unsqueeze(0))
 
-        cost_matrix: npt.NDArray[Any] = (distances * (1 + heights_diff * 30)).numpy()
+        cost_matrix: npt.NDArray[Any] = (
+            distances * (1 + heights_diff * self.height_difference_penalty)
+        ).numpy()
         return cost_matrix, wrapped_mask
 
     def match_lines(self, cost_matrix: npt.NDArray[Any]) -> tuple[npt.NDArray[Any], npt.NDArray[Any]]:

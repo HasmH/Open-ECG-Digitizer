@@ -1,0 +1,17 @@
+cabrera_12x1:
+  description: "12×1 Cabrera layout"
+  layout:
+    rows: 12
+    cols: 1
+  leads: ["aVL", "I", "-aVR", "II", "aVF", "III", "V1", "V2", "V3", "V4", "V5", "V6"]
+  rhythm_leads: []
+  total_rows: 12
+
+standard_12x1:
+  description: "12×1 standard layout"
+  layout:
+    rows: 12
+    cols: 1
+  leads: ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
+  rhythm_leads: []
+  total_rows: 12
