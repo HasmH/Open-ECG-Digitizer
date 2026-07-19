@@ -23,6 +23,7 @@ class SignalExtractor:
     min_line_width: int
     height_difference_penalty: float
     num_peaks: Optional[int]
+    x_offset: int
     num_bands: Optional[int]
     band_overlap_fraction: float
     band_smoothing_fraction: float
@@ -61,6 +62,7 @@ class SignalExtractor:
         self.band_overlap_fraction = band_overlap_fraction
         self.band_smoothing_fraction = band_smoothing_fraction
         self.num_peaks = None
+        self.x_offset = 0
 
     def __call__(self, feature_map: torch.Tensor) -> torch.Tensor:
         fmap = feature_map.cpu().clone()
@@ -366,6 +368,9 @@ class SignalExtractor:
         lines[lines == 0] = float("nan")
         valid_cols = lines.nan_to_num(0.0).abs().sum(0) > 0
         first, last = torch.nonzero(valid_cols, as_tuple=True)[0][[0, -1]].tolist()
+        # Remember how many leading columns were trimmed, so callers can place the
+        # trimmed lines back at their true x position (e.g. overlay plotting).
+        self.x_offset = first
         return lines[:, first : last + 1]
 
     def extract_endpoints(self, lines: torch.Tensor) -> tuple[list[int], list[int], list[float], list[float]]:

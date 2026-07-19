@@ -84,8 +84,13 @@ def save_timeseries_csv(canonical: torch.Tensor | None, output_basepath: str) ->
     np.savetxt(output_basepath + "_timeseries_canonical.csv", data, delimiter=",", header=header, comments="")
 
 
-def plot_extracted_trace_overlay(ax: Any, raw_lines: torch.Tensor | None) -> None:
-    """Draw pixel-coordinate signal-extractor output on the aligned ECG image."""
+def plot_extracted_trace_overlay(ax: Any, raw_lines: torch.Tensor | None, x_offset: int = 0) -> None:
+    """Draw pixel-coordinate signal-extractor output on the aligned ECG image.
+
+    ``x_offset`` is the number of leading columns the extractor trimmed from the
+    lines; adding it back places the overlay at its true x position on the aligned
+    image (otherwise the trace appears shifted left).
+    """
     if raw_lines is None or raw_lines.numel() == 0:
         return
 
@@ -93,7 +98,7 @@ def plot_extracted_trace_overlay(ax: Any, raw_lines: torch.Tensor | None) -> Non
     if lines.ndim == 1:
         lines = lines[None, :]
 
-    x = np.arange(lines.shape[1])
+    x = np.arange(lines.shape[1]) + x_offset
     for index, line in enumerate(lines):
         ax.plot(
             x,
@@ -114,7 +119,8 @@ def save_png_plot(got_values: dict[str, Any], canonical: torch.Tensor | None, ou
     axs[0, 0].set_title("Resampled input and detected crop corners")
     axs[0, 1].imshow(got_values["aligned"]["image"].squeeze().permute(1, 2, 0).cpu().numpy() * 0.999)
     raw_lines = got_values.get("signal", {}).get("raw_lines")
-    plot_extracted_trace_overlay(axs[0, 1], raw_lines)
+    x_offset = got_values.get("signal", {}).get("raw_lines_x_offset", 0)
+    plot_extracted_trace_overlay(axs[0, 1], raw_lines, x_offset)
     axs[0, 1].set_title("Perspective-aligned image and extracted traces")
     axs[1, 0].imshow(got_values["aligned"]["signal_prob"].squeeze().cpu().numpy(), interpolation="none", vmin=0, vmax=1)
     axs[1, 0].set_title("Signal segmentation probability")

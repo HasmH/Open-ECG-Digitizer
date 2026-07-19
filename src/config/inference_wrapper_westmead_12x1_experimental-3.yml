@@ -13,10 +13,10 @@ MODEL:
           num_bands: 12
           max_iterations: 8
           candidate_span: 10
-          split_num_stripes: 5
-          threshold_line_in_mask: 0.90
+          split_num_stripes: 8 #<<<<<
+          threshold_line_in_mask: 0.98 #<<<<
           threshold_sum: 2.0
-          label_thresh: 0.08
+          label_thresh: 0.10 #<<<<
           min_line_width: 5
           # Default is 30. Lowering it helps reconnect fragments separated by
           # tall deflections while retaining some adjacent-lead protection.
@@ -85,6 +85,6 @@ MODEL:
 DATA:
   images_path: '/Users/hasam/Desktop/data/images/2'
   image_extensions: ['.png']
-  output_path: 'sandbox/inference_output_westmead_12x1_experimental_7'
+  output_path: 'sandbox/final2'
   save_mode: 'all'
   layout_should_include_substring: null

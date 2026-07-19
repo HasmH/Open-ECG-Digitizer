@@ -167,6 +167,7 @@ class InferenceWrapper(Module):
             },
             "signal": {
                 "raw_lines": signals.cpu(),
+                "raw_lines_x_offset": getattr(self.signal_extractor, "x_offset", 0),
                 "canonical_lines": layout.get("canonical_lines", None),
                 "lines": layout.get("lines", None),
                 "layout_matching_cost": layout_cost,
