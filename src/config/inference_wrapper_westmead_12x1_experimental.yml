@@ -10,7 +10,6 @@ MODEL:
           # Layout-aware per-band extraction: split the signal map into 12
           # horizontal lead bands and extract each independently so tall
           # deflections cannot be captured into an adjacent lead's region.
-          num_bands: 12
           max_iterations: 8
           candidate_span: 10
           split_num_stripes: 5
