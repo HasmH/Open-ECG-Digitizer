@@ -21,6 +21,7 @@ class SignalExtractor:
     lam: float
     min_line_width: int
     height_difference_penalty: float
+    random_seed: Optional[int]
     num_peaks: Optional[int]
     x_offset: int
 
@@ -36,6 +37,7 @@ class SignalExtractor:
         lam: float = 0.5,
         min_line_width: int = 30,
         height_difference_penalty: float = 30.0,
+        random_seed: Optional[int] = None,
     ) -> None:
         if height_difference_penalty < 0:
             raise ValueError("height_difference_penalty must be non-negative")
@@ -49,10 +51,15 @@ class SignalExtractor:
         self.lam = lam
         self.min_line_width = min_line_width
         self.height_difference_penalty = height_difference_penalty
+        self.random_seed = random_seed
+        self._random_generator: Optional[torch.Generator] = None
+        if random_seed is not None:
+            self._random_generator = torch.Generator(device="cpu")
         self.num_peaks = None
         self.x_offset = 0
 
     def __call__(self, feature_map: torch.Tensor) -> torch.Tensor:
+        self._reset_random_generator()
         fmap = feature_map.cpu().clone()
         lines_list = self._iterative_extraction(fmap)
         self.num_peaks = self._autodetect_num_peaks(fmap)
@@ -168,6 +175,11 @@ class SignalExtractor:
 
         return torch.tensor(path_y), img
 
+    def _reset_random_generator(self) -> None:
+        """Reset deterministic path tie-breaking at the start of each ECG."""
+        if self._random_generator is not None and self.random_seed is not None:
+            self._random_generator.manual_seed(self.random_seed)
+
     def _get_pixel_vals(self, blurry_img: torch.Tensor, candidates: torch.Tensor, x: int) -> torch.Tensor:
         middle = len(candidates) // 2
         this_col = blurry_img[candidates, x - 1]
@@ -177,7 +189,7 @@ class SignalExtractor:
             seg = slice(min(i, middle), max(i, middle) + 1)
             pixel_vals.append((this_col[seg].mean() + other_col[seg].mean()) / 2)
         vals = torch.stack(pixel_vals)
-        vals += torch.randn(len(candidates)) * 1e-6
+        vals += torch.randn(len(candidates), generator=self._random_generator) * 1e-6
         vals += vals.std() * torch.tensor(np.linspace(-1, 1, len(candidates)) ** 2, dtype=torch.float32)
         return vals
 

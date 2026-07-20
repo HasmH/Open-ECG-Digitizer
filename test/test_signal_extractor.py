@@ -27,3 +27,27 @@ def test_height_difference_penalty_rejects_negative_values() -> None:
         assert str(error) == "height_difference_penalty must be non-negative"
     else:
         raise AssertionError("Expected a negative height_difference_penalty to be rejected")
+
+
+def test_random_seed_makes_path_tie_breaking_repeatable() -> None:
+    extractor = SignalExtractor(random_seed=42)
+    image = torch.zeros((5, 2), dtype=torch.float32)
+    candidates = torch.arange(5)
+
+    extractor._reset_random_generator()
+    first = extractor._get_pixel_vals(image, candidates, x=1)
+    extractor._reset_random_generator()
+    second = extractor._get_pixel_vals(image, candidates, x=1)
+
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+
+
+def test_unseeded_path_tie_breaking_remains_stochastic() -> None:
+    extractor = SignalExtractor()
+    image = torch.zeros((5, 2), dtype=torch.float32)
+    candidates = torch.arange(5)
+
+    first = extractor._get_pixel_vals(image, candidates, x=1)
+    second = extractor._get_pixel_vals(image, candidates, x=1)
+
+    assert not torch.equal(first, second)
