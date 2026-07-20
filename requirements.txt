@@ -2,6 +2,7 @@ ipython
 matplotlib
 numpy
 pillow
+pdf2image
 scikit-image
 scipy
 torch

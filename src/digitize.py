@@ -84,13 +84,46 @@ def save_timeseries_csv(canonical: torch.Tensor | None, output_basepath: str) ->
     np.savetxt(output_basepath + "_timeseries_canonical.csv", data, delimiter=",", header=header, comments="")
 
 
+def plot_extracted_trace_overlay(ax: Any, raw_lines: torch.Tensor | None, x_offset: int = 0) -> None:
+    """Draw pixel-coordinate signal-extractor output on the aligned ECG image.
+
+    ``x_offset`` is the number of leading columns the extractor trimmed from the
+    lines; adding it back places the overlay at its true x position on the aligned
+    image (otherwise the trace appears shifted left).
+    """
+    if raw_lines is None or raw_lines.numel() == 0:
+        return
+
+    lines: npt.NDArray[Any] = raw_lines.detach().squeeze().cpu().numpy()
+    if lines.ndim == 1:
+        lines = lines[None, :]
+
+    x = np.arange(lines.shape[1]) + x_offset
+    for index, line in enumerate(lines):
+        ax.plot(
+            x,
+            line,
+            color="#00BFFF",
+            linewidth=0.8,
+            alpha=0.9,
+            label="Extracted centreline" if index == 0 else None,
+        )
+    ax.legend(loc="upper right")
+
+
 def save_png_plot(got_values: dict[str, Any], canonical: torch.Tensor | None, output_basepath: str) -> None:
     fig, axs = plt.subplots(2, 2, figsize=(20, 14))
     axs[0, 0].imshow(got_values["input_image"].squeeze().permute(1, 2, 0).cpu().numpy() * 0.999)
     source_points = got_values["source_points"]
     axs[0, 0].scatter(source_points[:, 0].cpu().numpy(), source_points[:, 1].cpu().numpy(), s=20, c="red")
+    axs[0, 0].set_title("Resampled input and detected crop corners")
     axs[0, 1].imshow(got_values["aligned"]["image"].squeeze().permute(1, 2, 0).cpu().numpy() * 0.999)
+    raw_lines = got_values.get("signal", {}).get("raw_lines")
+    x_offset = got_values.get("signal", {}).get("raw_lines_x_offset", 0)
+    plot_extracted_trace_overlay(axs[0, 1], raw_lines, x_offset)
+    axs[0, 1].set_title("Perspective-aligned image and extracted traces")
     axs[1, 0].imshow(got_values["aligned"]["signal_prob"].squeeze().cpu().numpy(), interpolation="none", vmin=0, vmax=1)
+    axs[1, 0].set_title("Signal segmentation probability")
     for i in range(0, 15, 2):
         for j in range(0, 15, 2):
             xval = i * 5 / got_values["pixel_spacing_mm"]["x"]
@@ -105,15 +138,16 @@ def save_png_plot(got_values: dict[str, Any], canonical: torch.Tensor | None, ou
                 )
             )
     if canonical is not None:
-        lines: npt.NDArray[Any] = canonical.squeeze().cpu().numpy()
-        lines -= np.linspace(0, 24_000, num=lines.shape[0])[:, None]  # 2 uV offset per lead
+        lines = canonical.squeeze().cpu().numpy().copy()
+        lines -= np.arange(lines.shape[0])[:, None] * 2_000  # 2 mV (2,000 uV) display offset per lead
         axs[1, 1].plot(lines.T, linewidth=0.5)
-    plt.tight_layout()
-    plt.suptitle(
+    axs[1, 1].set_title("Canonical digitised lead signals")
+    fig.suptitle(
         got_values.get("layout_name", "") + " Layout cost: " + f'{got_values["signal"]["layout_matching_cost"]:.2f}',
         fontsize=16,
     )
-    plt.savefig(output_basepath + ".png", dpi=200)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(output_basepath + ".png", dpi=200)
     plt.close()
 
 

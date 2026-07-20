@@ -39,6 +39,9 @@ class InferenceWrapper(Module):
         enable_timing: bool = False,
         minimum_image_size: int = 512,
         apply_dewarping: bool = True,
+        edge_resegment_scale: float | None = None,
+        edge_resegment_fraction: float = 0.15,
+        edge_resegment_max_tile_px: int = 6_000_000,
     ) -> None:
         """Inference wrapper for ECG pipeline.
 
@@ -54,6 +57,14 @@ class InferenceWrapper(Module):
             enable_timing: Whether to print timings.
             minimum_image_size: Minimum allowed image size.
             apply_dewarping: Whether to apply dewarping (perspective correction is still performed regardless).
+            edge_resegment_scale: If set, re-segment horizontal regions of the aligned image at this
+                upscale factor and splice the sharper signal probability back in. Recovers fine
+                deflections (e.g. edge-lead cutoffs) that are lost at the global resample scale.
+                None disables it.
+            edge_resegment_fraction: Fraction of the image height, from the top AND from the bottom,
+                to re-segment. Small values (~0.15) target only the border leads; >= 0.5 covers the
+                whole image (all leads). Each region is processed in memory-bounded tiles.
+            edge_resegment_max_tile_px: Upper bound on upscaled pixels per tile, to cap peak memory.
         """
         super().__init__()
         self.config = config
@@ -67,6 +78,9 @@ class InferenceWrapper(Module):
         self._timing_enabled = enable_timing
         self.minimum_image_size = minimum_image_size
         self.apply_dewarping = apply_dewarping
+        self.edge_resegment_scale = edge_resegment_scale
+        self.edge_resegment_fraction = edge_resegment_fraction
+        self.edge_resegment_max_tile_px = edge_resegment_max_tile_px
 
         self.signal_extractor = self._load_signal_extractor()
         self.perspective_detector: Any = self._load_perspective_detector()
@@ -109,6 +123,10 @@ class InferenceWrapper(Module):
             image, signal_prob, grid_prob, text_prob, source_points
         )
 
+        if self.edge_resegment_scale:
+            with timed_section("Edge re-segmentation", self.times):
+                aligned_signal_prob = self._resegment_regions(aligned_image, aligned_signal_prob)
+
         with timed_section("Pixel size search", self.times):
             mm_per_pixel_x, mm_per_pixel_y = self.pixel_size_finder(aligned_grid_prob)
             avg_pixel_per_mm = (1 / mm_per_pixel_x + 1 / mm_per_pixel_y) / 2
@@ -149,6 +167,7 @@ class InferenceWrapper(Module):
             },
             "signal": {
                 "raw_lines": signals.cpu(),
+                "raw_lines_x_offset": getattr(self.signal_extractor, "x_offset", 0),
                 "canonical_lines": layout.get("canonical_lines", None),
                 "lines": layout.get("lines", None),
                 "layout_matching_cost": layout_cost,
@@ -210,6 +229,11 @@ class InferenceWrapper(Module):
             return int(non_zero[0].item()), int(non_zero[-1].item())
 
         y1, y2 = get_bounds(signal_prob + grid_prob)
+        vertical_padding_fraction = float(getattr(self.cropper, "vertical_padding_fraction", 0.0))
+        content_height = y2 - y1 + 1
+        vertical_padding = round(content_height * vertical_padding_fraction)
+        y1 = max(0, y1 - vertical_padding)
+        y2 = min(image.shape[-2] - 1, y2 + vertical_padding)
 
         slices = (slice(None), slice(None), slice(y1, y2 + 1), slice(None))
         return image[slices], signal_prob[slices], grid_prob[slices], text_prob[slices]
@@ -260,10 +284,14 @@ class InferenceWrapper(Module):
                 return interpolated
 
             if isinstance(self.resample_size, int):
-                if max_dim > self.resample_size:
+                if max_dim != self.resample_size:
                     scale = self.resample_size / max_dim
                     new_size = (int(height * scale), int(width * scale))
-                    return F.interpolate(image, size=new_size, mode="bilinear", align_corners=False, antialias=True)
+                    # antialias only matters when downscaling; upscaling past the
+                    # native size sharpens fine deflections for the segmentation net.
+                    return F.interpolate(
+                        image, size=new_size, mode="bilinear", align_corners=False, antialias=scale < 1
+                    )
                 return image
 
             if isinstance(self.resample_size, tuple):
@@ -294,6 +322,90 @@ class InferenceWrapper(Module):
             text_prob = self.process_sparse_prob(text_prob)
 
             return signal_prob, grid_prob, text_prob
+
+    def _resegment_regions(self, image: Tensor, signal_prob: Tensor) -> Tensor:
+        """Re-segment horizontal regions of the aligned image at higher resolution.
+
+        Runs the segmentation network again on upscaled strips of the (already
+        perspective-aligned) image and splices the sharper signal probability
+        back into ``signal_prob``. This recovers fine deflections that the global
+        resample scale loses -- typically the border leads whose tall/deep
+        deflections are under-segmented. It is memory-safe: each region is
+        processed in tiles bounded by ``edge_resegment_max_tile_px``, so it never
+        materialises a full-page high-resolution activation the way a global
+        upscale would (which OOMs on modest hardware).
+
+        Args:
+            image: Aligned image, shape (1, 3, H, W).
+            signal_prob: Aligned signal probability, shape (1, 1, H, W), updated in place.
+
+        Returns:
+            The updated signal probability tensor.
+        """
+        height = image.shape[-2]
+        fraction = self.edge_resegment_fraction
+        if fraction >= 0.5:
+            regions = [(0, height)]
+        else:
+            top = self._snap_to_gap(signal_prob, int(height * fraction))
+            bottom = self._snap_to_gap(signal_prob, int(height * (1.0 - fraction)))
+            regions = [(0, max(1, top)), (min(height - 1, bottom), height)]
+
+        for y0, y1 in regions:
+            self._resegment_region(image, signal_prob, y0, y1)
+        return signal_prob
+
+    def _snap_to_gap(self, signal_prob: Tensor, y: int, window: int = 40) -> int:
+        """Nudge a splice boundary to the lowest-signal row nearby, so the seam
+        lands in an inter-lead gap rather than through a trace."""
+        row_mass = signal_prob.squeeze(0).squeeze(0).sum(dim=1)
+        height = row_mass.shape[0]
+        lo, hi = max(0, y - window), min(height, y + window + 1)
+        if hi - lo <= 0:
+            return y
+        return lo + int(torch.argmin(row_mass[lo:hi]).item())
+
+    def _resegment_region(self, image: Tensor, signal_prob: Tensor, y0: int, y1: int) -> None:
+        """Re-segment one region [y0, y1), tiling it to bound peak memory.
+
+        Internal tile boundaries are snapped to inter-lead gaps so a seam never
+        falls through a trace -- important when a large region (e.g. the whole
+        image, at edge_resegment_fraction >= 0.5) needs several tiles.
+        """
+        scale = float(self.edge_resegment_scale)  # type: ignore[arg-type]
+        width = image.shape[-1]
+        max_rows = max(1, int(self.edge_resegment_max_tile_px / (width * scale * scale)))
+
+        boundaries = [y0]
+        while boundaries[-1] + max_rows < y1:
+            boundaries.append(self._snap_to_gap(signal_prob, boundaries[-1] + max_rows))
+        boundaries.append(y1)
+
+        for ty0, ty1 in zip(boundaries[:-1], boundaries[1:]):
+            if ty1 > ty0:
+                self._resegment_tile(image, signal_prob, ty0, ty1)
+
+    def _resegment_tile(self, image: Tensor, signal_prob: Tensor, y0: int, y1: int) -> None:
+        scale = float(self.edge_resegment_scale)  # type: ignore[arg-type]
+        strip = image[:, :, y0:y1, :]
+        height, width = strip.shape[-2], strip.shape[-1]
+        upscaled = F.interpolate(strip, scale_factor=scale, mode="bilinear", align_corners=False)
+        # Per-strip min-max normalisation, matching the validated isolation
+        # experiment: it gives the network the contrast it expects on a crop and
+        # is what let the recovered deflections (e.g. V6 S-waves) appear.
+        upscaled = self.min_max_normalize(upscaled)
+        with torch.no_grad():
+            prob = torch.softmax(self.segmentation_model(upscaled.to(self.device)), dim=1)
+        resegmented = self.process_sparse_prob(prob[:, [self.signal_class], :, :])
+        resegmented = F.interpolate(resegmented, size=(height, width), mode="bilinear", align_corners=False)
+        # Replace outright with the re-segmentation. It already contains everything
+        # the global pass found for this strip plus the recovered deflections, so
+        # there is nothing to combine. (Max-combining re-injected the old baseline,
+        # which sits at a slightly different sub-pixel row and produced a doubled,
+        # bold horizontal line; intensity-matching to the old strip dampened the
+        # very deflections we were recovering. Both were wrong -- a clean replace
+        # of the gap-snapped strip is what matched the isolation experiment.)
+        signal_prob[:, :, y0:y1, :] = resegmented
 
     def min_max_normalize(self, image: Tensor) -> Tensor:
         return (image - image.min()) / (image.max() - image.min())

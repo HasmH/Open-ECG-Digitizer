@@ -20,7 +20,10 @@ class SignalExtractor:
     debug: int
     lam: float
     min_line_width: int
+    height_difference_penalty: float
+    random_seed: Optional[int]
     num_peaks: Optional[int]
+    x_offset: int
 
     def __init__(
         self,
@@ -33,7 +36,11 @@ class SignalExtractor:
         debug: int = 0,
         lam: float = 0.5,
         min_line_width: int = 30,
+        height_difference_penalty: float = 30.0,
+        random_seed: Optional[int] = None,
     ) -> None:
+        if height_difference_penalty < 0:
+            raise ValueError("height_difference_penalty must be non-negative")
         self.threshold_sum = threshold_sum
         self.threshold_line_in_mask = threshold_line_in_mask
         self.label_thresh = label_thresh
@@ -43,9 +50,16 @@ class SignalExtractor:
         self.debug = debug
         self.lam = lam
         self.min_line_width = min_line_width
+        self.height_difference_penalty = height_difference_penalty
+        self.random_seed = random_seed
+        self._random_generator: Optional[torch.Generator] = None
+        if random_seed is not None:
+            self._random_generator = torch.Generator(device="cpu")
         self.num_peaks = None
+        self.x_offset = 0
 
     def __call__(self, feature_map: torch.Tensor) -> torch.Tensor:
+        self._reset_random_generator()
         fmap = feature_map.cpu().clone()
         lines_list = self._iterative_extraction(fmap)
         self.num_peaks = self._autodetect_num_peaks(fmap)
@@ -161,6 +175,11 @@ class SignalExtractor:
 
         return torch.tensor(path_y), img
 
+    def _reset_random_generator(self) -> None:
+        """Reset deterministic path tie-breaking at the start of each ECG."""
+        if self._random_generator is not None and self.random_seed is not None:
+            self._random_generator.manual_seed(self.random_seed)
+
     def _get_pixel_vals(self, blurry_img: torch.Tensor, candidates: torch.Tensor, x: int) -> torch.Tensor:
         middle = len(candidates) // 2
         this_col = blurry_img[candidates, x - 1]
@@ -170,7 +189,7 @@ class SignalExtractor:
             seg = slice(min(i, middle), max(i, middle) + 1)
             pixel_vals.append((this_col[seg].mean() + other_col[seg].mean()) / 2)
         vals = torch.stack(pixel_vals)
-        vals += torch.randn(len(candidates)) * 1e-6
+        vals += torch.randn(len(candidates), generator=self._random_generator) * 1e-6
         vals += vals.std() * torch.tensor(np.linspace(-1, 1, len(candidates)) ** 2, dtype=torch.float32)
         return vals
 
@@ -218,6 +237,9 @@ class SignalExtractor:
         lines[lines == 0] = float("nan")
         valid_cols = lines.nan_to_num(0.0).abs().sum(0) > 0
         first, last = torch.nonzero(valid_cols, as_tuple=True)[0][[0, -1]].tolist()
+        # Remember how many leading columns were trimmed, so callers can place the
+        # trimmed lines back at their true x position (e.g. overlay plotting).
+        self.x_offset = first
         return lines[:, first : last + 1]
 
     def extract_endpoints(self, lines: torch.Tensor) -> tuple[list[int], list[int], list[float], list[float]]:
@@ -267,7 +289,9 @@ class SignalExtractor:
         heights_norm = (heights - heights.min()) / heights.max()
         heights_diff = torch.abs(heights_norm.unsqueeze(1) - heights_norm.unsqueeze(0))
 
-        cost_matrix: npt.NDArray[Any] = (distances * (1 + heights_diff * 30)).numpy()
+        cost_matrix: npt.NDArray[Any] = (
+            distances * (1 + heights_diff * self.height_difference_penalty)
+        ).numpy()
         return cost_matrix, wrapped_mask
 
     def match_lines(self, cost_matrix: npt.NDArray[Any]) -> tuple[npt.NDArray[Any], npt.NDArray[Any]]:
