@@ -6,3 +6,5 @@ venv
 src/scripts/visualized_transforms
 src/report/figures
 sandbox/
+ecgs/
+braveheart/
