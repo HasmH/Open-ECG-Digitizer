@@ -6,7 +6,11 @@ from torchvision.transforms.functional import perspective
 
 class Cropper(torch.nn.Module):
     def __init__(
-        self, granularity: int = 50, percentiles: Tuple[float, float] = (0.01, 0.99), alpha: float = 0.9
+        self,
+        granularity: int = 50,
+        percentiles: Tuple[float, float] = (0.01, 0.99),
+        alpha: float = 0.9,
+        vertical_padding_fraction: float = 0.0,
     ) -> None:
         """
         The Cropper module is used to correct for perspective distortion in images, while also cropping the image to mostly include the signal.
@@ -15,11 +19,16 @@ class Cropper(torch.nn.Module):
             granularity (int): The number of lines defining the bins in the horizontal and vertical directions.
             percentiles (Tuple[float, float]): The percentiles defining the range of signal probabilities that should be included in the output
             alpha (float): A factor to control the influence of the source points on the destination points in the perspective transformation.
+            vertical_padding_fraction (float): Extra space above and below the detected quadrilateral,
+                expressed as a fraction of its left and right edge heights.
         """
         super(Cropper, self).__init__()
+        if vertical_padding_fraction < 0:
+            raise ValueError("vertical_padding_fraction must be non-negative")
         self.granularity = granularity
         self.percentiles = percentiles
         self.alpha = alpha
+        self.vertical_padding_fraction = vertical_padding_fraction
 
     def forward(self, signal_probabilities: torch.Tensor, params: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
@@ -53,7 +62,27 @@ class Cropper(torch.nn.Module):
             lower_bound_vertical,
             upper_bound_vertical,
         )
-        return source_points
+        return self._add_vertical_padding(
+            source_points,
+            height=signal_probabilities.shape[-2],
+            width=signal_probabilities.shape[-1],
+        )
+
+    def _add_vertical_padding(self, source_points: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        """Extend the quadrilateral vertically while retaining its perspective."""
+        if self.vertical_padding_fraction == 0:
+            return source_points
+
+        padded = source_points.clone()
+        left_edge = source_points[3] - source_points[0]
+        right_edge = source_points[2] - source_points[1]
+        padded[0] -= self.vertical_padding_fraction * left_edge
+        padded[1] -= self.vertical_padding_fraction * right_edge
+        padded[2] += self.vertical_padding_fraction * right_edge
+        padded[3] += self.vertical_padding_fraction * left_edge
+        padded[:, 0].clamp_(0, width - 1)
+        padded[:, 1].clamp_(0, height - 1)
+        return padded
 
     def _calculate_source_points(
         self,

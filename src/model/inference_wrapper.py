@@ -210,6 +210,10 @@ class InferenceWrapper(Module):
             return int(non_zero[0].item()), int(non_zero[-1].item())
 
         y1, y2 = get_bounds(signal_prob + grid_prob)
+        padding_fraction = float(getattr(self.cropper, "vertical_padding_fraction", 0.0))
+        vertical_padding = round((y2 - y1 + 1) * padding_fraction)
+        y1 = max(0, y1 - vertical_padding)
+        y2 = min(image.shape[-2] - 1, y2 + vertical_padding)
 
         slices = (slice(None), slice(None), slice(y1, y2 + 1), slice(None))
         return image[slices], signal_prob[slices], grid_prob[slices], text_prob[slices]
